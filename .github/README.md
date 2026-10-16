@@ -40,9 +40,3 @@ See `conf/mod_learnspells.conf.dist`:
 2. Re-run cmake and launch a clean build of AzerothCore
 3. Ready.
 
-### AzerothCore Links:
-
-- GitHub: [Organisation](https://github.com/azerothcore)
-- GitHub: [WOTLK](https://github.com/azerothcore/azerothcore-wotlk) Repository
-- Website: [AzerothCore](http://azerothcore.org)
-- Discord: [AzerothCore](https://discord.com/invite/gkt4y2x)
