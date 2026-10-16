@@ -11,12 +11,19 @@ class LearnSpellsOnLevelUp : public PlayerScript
 public:
     LearnSpellsOnLevelUp() : PlayerScript("LearnSpellsOnLevelUp", {
         PLAYERHOOK_ON_FIRST_LOGIN,
+        PLAYERHOOK_ON_LOGIN,
         PLAYERHOOK_ON_LEVEL_CHANGED
     }) { }
 
+    void OnPlayerLogin(Player* player) override
+    {
+        if (sConfigMgr->GetOption<bool>("LearnSpells.Enable", true) && sConfigMgr->GetOption<bool>("LearnSpells.Announce", true))
+            ChatHandler(player->GetSession()).SendSysMessage("This server is running the |cff4CFF00Learn Spells |rmodule.");
+    }
+
     void OnPlayerFirstLogin(Player* player) override
     {
-        if (sConfigMgr->GetOption<bool>("LearnSpells.OnFirstLogin", 0))
+        if (sConfigMgr->GetOption<bool>("LearnSpells.Enable", true) && sConfigMgr->GetOption<bool>("LearnSpells.OnFirstLogin", 0))
             LearnSpellsForNewLevel(player, 1);
 
         if (player->getClass() == CLASS_SHAMAN)
@@ -59,6 +66,9 @@ private:
 
         // OPTIONAL QUEST SPELLS
         18540,
+
+        // Bear Form (Passive2), extra threat in every druid form
+        21178,
     };
 
     struct AddSpell // Additional Spell Entry
@@ -434,7 +444,7 @@ private:
                 if (DisableMgr::IsDisabledFor(DISABLE_TYPE_SPELL, spellInfo->Id, player))
                     continue;
 
-                if (spellInfo->BaseLevel != uint32(level) && sSpellMgr->IsSpellValid(spellInfo))
+                if (spellInfo->BaseLevel != uint32(level) || !sSpellMgr->IsSpellValid(spellInfo))
                     continue;
 
                 bool valid = false;
