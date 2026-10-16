@@ -18,6 +18,24 @@ LearnSpells.Announce = 1
 
 LearnSpells.OnFirstLogin = 0
 
+# Learn every missing spell up to the current level on each login?
+# Useful for characters that existed before the module was installed.
+# (1: true | 0: false)
+
+LearnSpells.OnLogin = 0
+
+# Learn spells that are normally rewarded by class quests?
+# (Warrior stances, Warlock demons, Druid forms, ...)
+# (1: true | 0: false)
+
+LearnSpells.QuestSpells = 1
+
+# Comma separated list of spell ids that should never be learned.
+# Comes on top of the module's built-in list and can be changed with .reload config
+#	Example: LearnSpells.IgnoreSpells = "21178, 18540"
+
+LearnSpells.IgnoreSpells = ""
+
 # Max level Limit the player will learn spells
 # 	Default:  = 80
 

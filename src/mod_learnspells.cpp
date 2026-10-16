@@ -1,10 +1,269 @@
 #include "Chat.h"
 #include "Config.h"
+#include "DatabaseEnv.h"
 #include "DisableMgr.h"
+#include "Item.h"
+#include "Log.h"
+#include "Mail.h"
+#include "ObjectMgr.h"
 #include "Player.h"
+#include "QuestDef.h"
 #include "ScriptMgr.h"
 #include "SpellInfo.h"
 #include "SpellMgr.h"
+#include "StringConvert.h"
+#include "Tokenize.h"
+#include <algorithm>
+#include <array>
+#include <mutex>
+#include <shared_mutex>
+
+namespace
+{
+// Never learned through the class spell scan or class quest rewards.
+// Spells handed out explicitly through the additional spell list are not affected by this list.
+std::unordered_set<uint32> const BuiltinIgnoredSpells =
+{
+    64380, 23885, 23880, 44461, 25346, 10274, 10273, 8418,  8419,  7270,  7269,  7268,  54648, 12536, 24530, 70909, 12494, 57933, 24224, 27095, 27096, 27097, 27099, 32841, 56131, 56160, 56161, 48153, 34754, 64844, 64904, 48085, 33110, 48084,
+    28276, 27874, 27873, 7001,  49821, 53022, 47757, 47750, 47758, 47666, 53001, 52983, 52998, 52986, 52987, 52999, 52984, 53002, 53003, 53000, 52988, 52985, 42208, 42209, 42210, 42211, 42212, 42213, 42198, 42937, 42938, 12484, 12485, 12486,
+    55361, 55362, 34913, 43043, 43044, 38703, 38700, 27076, 42844, 42845, 64891, 25912, 25914, 25911, 25913, 25902, 25903, 27175, 27176, 33073, 33074, 48822, 48820, 48823, 48821, 20154, 25997, 20467, 20425, 67,    26017, 34471, 53254,
+    13812, 14314, 14315, 27026, 49064, 49065, 60202, 60210, 13797, 14298, 14299, 14300, 14301, 27024, 49053, 49054, 52399, 1742,  24453, 53548, 53562, 52016, 26064, 35346, 57386, 57389, 57390, 57391, 57392, 57393, 55509, 35886, 43339, 45297,
+    45298, 45299, 45300, 45301, 45302, 49268, 49269, 8349,  8502,  8503,  11306, 11307, 25535, 25537, 61650, 61654, 63685, 45284, 45286, 45287, 45288, 45289, 45290, 45291, 45292, 45293, 45294, 45295, 45296, 49239, 49240, 26364, 26365, 26366,
+    26367, 26369, 26370, 26363, 26371, 26372, 49278, 49279, 32176, 32175, 21169, 47206, 27285, 47833, 47836, 42223, 42224, 42225, 42226, 42218, 47817, 47818, 42231, 42232, 42233, 42230, 48466, 44203, 44205, 44206, 44207, 44208, 48444, 48445,
+    33891, 52374, 57532, 59921, 52372, 49142, 52375, 47633, 47632, 52373, 50536, 27214, 47822, 11682, 11681, 5857,  1010,  24907, 24905, 53227, 61391, 61390, 61388, 61387, 64801, 5421,  9635,  1178,  20186, 20185, 20184, 20187, 25899, 24406,
+    50581, 30708, 48076, 62900, 62901, 62902, 59671, 50589, 66906, 66907, 24131, 23455, 23458, 23459, 27803, 27804, 27805, 25329, 48075, 42243, 42244, 42245, 42234, 58432, 58433, 65878, 18848, 16979, 49376, 54055, 20647, 45470,
+    31898, 31804, 53733, 31803, 53742, 53725, 53726, 1804, 348, 1455, 1456, 11687, 11688, 11689, 27222, 57946, 25306, 53652, 53653, 53654, 7328, 10322, 10324, 20772, 20773, 48949, 48950, 33878, 33876, 33982, 33986, 33987, 33983, 48563, 48565,
+    48566, 48564,
+
+    //Dalaran Brilliance and Dalaran Intellect mage class as they are spells purchased in Dalaran with limited sales by NPCs
+    61316,61024,
+    
+    // COSMETIC SPELLS
+    28271, 28272, 61025, 61305, 61721, 61780,
+
+    // OPTIONAL QUEST SPELLS
+    18540,
+
+    // Bear Form (Passive2), extra threat in every druid form
+    21178,
+};
+
+class LearnSpellsData
+{
+public:
+    struct QuestSpell
+    {
+        uint32 questId;
+        uint32 spellId;
+        uint32 raceMask; // 0 = every race
+    };
+
+    static LearnSpellsData* instance()
+    {
+        static LearnSpellsData instance;
+        return &instance;
+    }
+
+    // LearnSpells.IgnoreSpells, comma separated spell ids. Applies to every spell the module teaches.
+    void LoadConfigIgnoredSpells()
+    {
+        std::unordered_set<uint32> ignored;
+        std::string const list = sConfigMgr->GetOption<std::string>("LearnSpells.IgnoreSpells", "");
+
+        for (std::string_view token : Acore::Tokenize(list, ',', false))
+        {
+            while (!token.empty() && token.front() == ' ')
+                token.remove_prefix(1);
+            while (!token.empty() && token.back() == ' ')
+                token.remove_suffix(1);
+
+            if (token.empty())
+                continue;
+
+            if (Optional<uint32> spellId = Acore::StringTo<uint32>(token))
+                ignored.insert(*spellId);
+            else
+                LOG_ERROR("module", "mod-learn-spells: LearnSpells.IgnoreSpells contains invalid spell id '{}'", token);
+        }
+
+        std::unique_lock lock(_ignoredLock);
+        _configIgnoredSpells = std::move(ignored);
+    }
+
+    bool IsConfigIgnored(uint32 spellId) const
+    {
+        std::shared_lock lock(_ignoredLock);
+        return _configIgnoredSpells.find(spellId) != _configIgnoredSpells.end();
+    }
+
+    bool IsIgnored(uint32 spellId) const
+    {
+        return BuiltinIgnoredSpells.find(spellId) != BuiltinIgnoredSpells.end() || IsConfigIgnored(spellId);
+    }
+
+    // Scanning the whole spell store is expensive, so it is done once at startup instead of on every level-up
+    void Build()
+    {
+        BuildClassSpells();
+        BuildQuestSpells();
+    }
+
+    std::vector<uint32> const& GetClassSpells(uint32 family, uint32 level) const
+    {
+        auto itr = _classSpells.find(family);
+        if (itr == _classSpells.end() || level >= itr->second.size())
+            return _emptyClassSpells;
+
+        return itr->second[level];
+    }
+
+    std::vector<QuestSpell> const& GetQuestSpells(uint8 classId, uint32 level) const
+    {
+        if (classId >= MAX_CLASSES || level >= _questSpells[classId].size())
+            return _emptyQuestSpells;
+
+        return _questSpells[classId][level];
+    }
+
+private:
+    static constexpr uint32 MAX_SPELL_LEVEL = 256;
+
+    void BuildClassSpells()
+    {
+        _classSpells.clear();
+        uint32 count = 0;
+
+        for (uint32 i = 0; i < sSpellMgr->GetSpellInfoStoreSize(); ++i)
+        {
+            SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(i);
+
+            if (!spellInfo || spellInfo->SpellFamilyName == SPELLFAMILY_GENERIC)
+                continue;
+
+            if (spellInfo->PowerType == POWER_FOCUS)
+                continue;
+
+            if (!spellInfo->BaseLevel || spellInfo->BaseLevel >= MAX_SPELL_LEVEL || !sSpellMgr->IsSpellValid(spellInfo))
+                continue;
+
+            bool fromTrainer = false;
+            SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellInfo->Id);
+
+            for (auto itr = bounds.first; itr != bounds.second; ++itr)
+            {
+                if (itr->second->Spell == spellInfo->Id && itr->second->RaceMask == 0 && itr->second->AcquireMethod == 0)
+                {
+                    fromTrainer = true;
+                    break;
+                }
+            }
+
+            if (!fromTrainer)
+                continue;
+
+            auto& levels = _classSpells[spellInfo->SpellFamilyName];
+            if (levels.empty())
+                levels.resize(MAX_SPELL_LEVEL);
+
+            levels[spellInfo->BaseLevel].push_back(spellInfo->Id);
+            ++count;
+        }
+
+        LOG_INFO("module", "mod-learn-spells: Loaded {} class spells", count);
+    }
+
+    // Class quests that teach a spell (warrior stances, warlock demons, druid forms, ...)
+    void BuildQuestSpells()
+    {
+        for (auto& levels : _questSpells)
+        {
+            levels.clear();
+            levels.resize(MAX_SPELL_LEVEL);
+        }
+
+        uint32 count = 0;
+
+        for (auto const& [questId, quest] : sObjectMgr->GetQuestTemplates())
+        {
+            uint32 classMask = quest->GetRequiredClasses();
+
+            // Only quests for exactly one class
+            if (!classMask || (classMask & (classMask - 1)))
+                continue;
+
+            uint8 classId = 1;
+            while (!(classMask & (1 << (classId - 1))))
+                ++classId;
+
+            // The Death Knight starting zone teaches its own spells
+            if (classId >= MAX_CLASSES || classId == CLASS_DEATH_KNIGHT)
+                continue;
+
+            std::string const& title = quest->GetTitle();
+            if (title.find("UNUSED") != std::string::npos || title.find("NYI") != std::string::npos || title.find("DEPRECATED") != std::string::npos)
+                continue;
+
+            uint32 rewardSpellId = quest->GetRewSpellCast() > 0 ? uint32(quest->GetRewSpellCast()) : quest->GetRewSpell();
+            SpellInfo const* rewardSpell = sSpellMgr->GetSpellInfo(rewardSpellId);
+            if (!rewardSpell)
+                continue;
+
+            for (SpellEffectInfo const& effect : rewardSpell->GetEffects())
+            {
+                if (effect.Effect != SPELL_EFFECT_LEARN_SPELL || !effect.TriggerSpell)
+                    continue;
+
+                SpellInfo const* learnedSpell = sSpellMgr->GetSpellInfo(effect.TriggerSpell);
+                if (!learnedSpell || !sSpellMgr->IsSpellValid(learnedSpell))
+                    continue;
+
+                uint32 level = quest->GetMinLevel();
+                if (!level)
+                    level = learnedSpell->BaseLevel;
+                if (!level)
+                    level = 1;
+
+                if (level >= MAX_SPELL_LEVEL)
+                    continue;
+
+                _questSpells[classId][level].push_back({ questId, learnedSpell->Id, quest->GetAllowableRaces() });
+                ++count;
+            }
+        }
+
+        LOG_INFO("module", "mod-learn-spells: Loaded {} class quest spells", count);
+    }
+
+    std::unordered_map<uint32, std::vector<std::vector<uint32>>> _classSpells;
+    std::array<std::vector<std::vector<QuestSpell>>, MAX_CLASSES> _questSpells;
+    std::vector<uint32> const _emptyClassSpells;
+    std::vector<QuestSpell> const _emptyQuestSpells;
+
+    std::unordered_set<uint32> _configIgnoredSpells;
+    mutable std::shared_mutex _ignoredLock;
+};
+
+#define sLearnSpells LearnSpellsData::instance()
+
+class LearnSpellsWorld : public WorldScript
+{
+public:
+    LearnSpellsWorld() : WorldScript("LearnSpellsWorld", {
+        WORLDHOOK_ON_AFTER_CONFIG_LOAD,
+        WORLDHOOK_ON_STARTUP
+    }) { }
+
+    void OnAfterConfigLoad(bool /*reload*/) override
+    {
+        sLearnSpells->LoadConfigIgnoredSpells();
+    }
+
+    void OnStartup() override
+    {
+        sLearnSpells->Build();
+    }
+};
+}
 
 class LearnSpellsOnLevelUp : public PlayerScript
 {
@@ -17,60 +276,41 @@ public:
 
     void OnPlayerLogin(Player* player) override
     {
-        if (sConfigMgr->GetOption<bool>("LearnSpells.Enable", true) && sConfigMgr->GetOption<bool>("LearnSpells.Announce", true))
+        if (!sConfigMgr->GetOption<bool>("LearnSpells.Enable", true))
+            return;
+
+        if (sConfigMgr->GetOption<bool>("LearnSpells.Announce", true))
             ChatHandler(player->GetSession()).SendSysMessage("This server is running the |cff4CFF00Learn Spells |rmodule.");
+
+        // Catch up on spells missed while the module was not installed or skipped them
+        if (sConfigMgr->GetOption<bool>("LearnSpells.OnLogin", false))
+            LearnSpellsUpTo(player, 1, MaxLearnLevel(player));
     }
 
     void OnPlayerFirstLogin(Player* player) override
     {
-        if (sConfigMgr->GetOption<bool>("LearnSpells.Enable", true) && sConfigMgr->GetOption<bool>("LearnSpells.OnFirstLogin", 0))
-            LearnSpellsForNewLevel(player, 1);
+        if (!sConfigMgr->GetOption<bool>("LearnSpells.Enable", true))
+            return;
+
+        if (sConfigMgr->GetOption<bool>("LearnSpells.OnFirstLogin", false))
+            LearnSpellsUpTo(player, 1, MaxLearnLevel(player));
 
         if (player->getClass() == CLASS_SHAMAN)
-        {
-            player->AddItem(5175, 1); // Earth Totem
-            player->AddItem(5176, 1); // Fire Totem
-            player->AddItem(5177, 1); // Water Totem
-            player->AddItem(5178, 1); // Air Totem
-        }
+            GiveItems(player, { 5175, 5176, 5177, 5178 }); // Earth, Fire, Water and Air Totem
     }
 
     void OnPlayerLevelChanged(Player* player, uint8 oldLevel) override
     {
-        if (sConfigMgr->GetOption<bool>("LearnSpells.Enable", true))
-        {
-            if (player->GetLevel() <= sConfigMgr->GetOption<uint8>("LearnSpells.MaxLevel", 80) && oldLevel < player->GetLevel())
-                LearnSpellsForNewLevel(player, oldLevel);
-        }
+        if (!sConfigMgr->GetOption<bool>("LearnSpells.Enable", true))
+            return;
+
+        uint8 upToLevel = MaxLearnLevel(player);
+
+        if (oldLevel < player->GetLevel() && oldLevel <= upToLevel)
+            LearnSpellsUpTo(player, oldLevel, upToLevel);
     }
 
 private:
-    std::unordered_set<uint32> m_ignoreSpells =
-    {
-        64380, 23885, 23880, 44461, 25346, 10274, 10273, 8418,  8419,  7270,  7269,  7268,  54648, 12536, 24530, 70909, 12494, 57933, 24224, 27095, 27096, 27097, 27099, 32841, 56131, 56160, 56161, 48153, 34754, 64844, 64904, 48085, 33110, 48084,
-        28276, 27874, 27873, 7001,  49821, 53022, 47757, 47750, 47758, 47666, 53001, 52983, 52998, 52986, 52987, 52999, 52984, 53002, 53003, 53000, 52988, 52985, 42208, 42209, 42210, 42211, 42212, 42213, 42198, 42937, 42938, 12484, 12485, 12486,
-        44461, 55361, 55362, 34913, 43043, 43044, 38703, 38700, 27076, 42844, 42845, 64891, 25912, 25914, 25911, 25913, 25902, 25903, 27175, 27176, 33073, 33074, 48822, 48820, 48823, 48821, 20154, 25997, 20467, 20425, 67,    26017, 34471, 53254,
-        13812, 14314, 14315, 27026, 49064, 49065, 60202, 60210, 13797, 14298, 14299, 14300, 14301, 27024, 49053, 49054, 52399, 1742,  24453, 53548, 53562, 52016, 26064, 35346, 57386, 57389, 57390, 57391, 57392, 57393, 55509, 35886, 43339, 45297,
-        45298, 45299, 45300, 45301, 45302, 49268, 49269, 8349,  8502,  8503,  11306, 11307, 25535, 25537, 61650, 61654, 63685, 45284, 45286, 45287, 45288, 45289, 45290, 45291, 45292, 45293, 45294, 45295, 45296, 49239, 49240, 26364, 26365, 26366,
-        26367, 26369, 26370, 26363, 26371, 26372, 49278, 49279, 32176, 32175, 21169, 47206, 27285, 47833, 47836, 42223, 42224, 42225, 42226, 42218, 47817, 47818, 42231, 42232, 42233, 42230, 48466, 44203, 44205, 44206, 44207, 44208, 48444, 48445,
-        33891, 52374, 57532, 59921, 52372, 49142, 52375, 47633, 47632, 52373, 50536, 27214, 47822, 11682, 11681, 5857,  1010,  24907, 24905, 53227, 61391, 61390, 61388, 61387, 64801, 5421,  9635,  1178,  20186, 20185, 20184, 20187, 25899, 24406,
-        50581, 30708, 48076, 62900, 62901, 62902, 59671, 50589, 66906, 66907, 24131, 23455, 23458, 23459, 27803, 27804, 27805, 25329, 48075, 42243, 42244, 42245, 42234, 58432, 58433, 65878, 18848, 16979, 49376, 54055, 20647, 42243, 24131, 45470,
-        31898, 31804, 53733, 31803, 53742, 53725, 53726, 1804, 348, 1455, 1456, 11687, 11688, 11689, 27222, 57946, 25306, 53652, 53653, 53654, 7328, 10322, 10324, 20772, 20773, 48949, 48950, 33878, 33876, 33982, 33986, 33987, 33983, 48563, 48565,
-        48566, 48564,
-
-        //Dalaran Brilliance and Dalaran Intellect mage class as they are spells purchased in Dalaran with limited sales by NPCs
-        61316,61024,
-        
-        // COSMETIC SPELLS
-        28271, 28272, 61025, 61305, 61721, 61780,
-
-        // OPTIONAL QUEST SPELLS
-        18540,
-
-        // Bear Form (Passive2), extra threat in every druid form
-        21178,
-    };
-
     struct AddSpell // Additional Spell Entry
     {
         uint32 spellId;
@@ -408,94 +648,121 @@ private:
         }},
     };
 
-    bool IsIgnoredSpell(uint32 spellID)
+    static uint8 MaxLearnLevel(Player const* player)
     {
-        return m_ignoreSpells.find(spellID) != m_ignoreSpells.end();
+        return std::min<uint8>(player->GetLevel(), sConfigMgr->GetOption<uint8>("LearnSpells.MaxLevel", 80));
     }
 
-    void LearnSpellsForNewLevel(Player* player, uint8 fromLevel)
+    void LearnSpellsUpTo(Player* player, uint32 fromLevel, uint32 upToLevel)
     {
-        uint8 upToLevel = player->GetLevel();
         uint32 family = GetSpellFamily(player);
+        bool questSpells = sConfigMgr->GetOption<bool>("LearnSpells.QuestSpells", true);
 
-        for (int level = fromLevel; level <= upToLevel; level++)
+        for (uint32 level = fromLevel; level <= upToLevel; ++level)
         {
             ApplyAdditionalSpells(level, family, player);
 
-            for (uint32 i = 0; i < sSpellMgr->GetSpellInfoStoreSize(); ++i)
+            if (questSpells)
+                LearnQuestSpells(level, player);
+
+            for (uint32 spellId : sLearnSpells->GetClassSpells(family, level))
             {
-                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(i);
-
-                if (!spellInfo)
+                if (player->HasSpell(spellId) || sLearnSpells->IsIgnored(spellId))
                     continue;
 
-                if (spellInfo->SpellFamilyName != family)
-                    continue;
+                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
 
                 if ((spellInfo->AttributesEx7 & SPELL_ATTR7_ALLIANCE_SPECIFIC_SPELL && player->GetTeamId() != TEAM_ALLIANCE) || (spellInfo->AttributesEx7 & SPELL_ATTR7_HORDE_SPECIFIC_SPELL && player->GetTeamId() != TEAM_HORDE))
                     continue;
 
-                if (spellInfo->PowerType == POWER_FOCUS)
+                if (DisableMgr::IsDisabledFor(DISABLE_TYPE_SPELL, spellId, player))
                     continue;
 
-                if (IsIgnoredSpell(spellInfo->Id))
+                SpellInfo const* prevSpell = spellInfo->GetPrevRankSpell();
+
+                if (prevSpell && !player->HasSpell(prevSpell->Id))
                     continue;
 
-                if (DisableMgr::IsDisabledFor(DISABLE_TYPE_SPELL, spellInfo->Id, player))
+                // Talents are only ranked up, never learned
+                if (GetTalentSpellPos(spellId) && (!prevSpell || spellInfo->GetRank() == 1))
                     continue;
 
-                if (spellInfo->BaseLevel != uint32(level) || !sSpellMgr->IsSpellValid(spellInfo))
-                    continue;
-
-                bool valid = false;
-
-                SkillLineAbilityMapBounds bounds = sSpellMgr->GetSkillLineAbilityMapBounds(spellInfo->Id);
-
-                for (auto itr = bounds.first; itr != bounds.second; ++itr)
-                {
-                    if (itr->second->Spell == spellInfo->Id && itr->second->RaceMask == 0 && itr->second->AcquireMethod == 0)
-                    {
-                        valid = true;
-                        SpellInfo const* prevSpell = spellInfo->GetPrevRankSpell();
-
-                        if (prevSpell && !player->HasSpell(prevSpell->Id))
-                        {
-                            valid = false;
-                            break;
-                        }
-
-                        if (GetTalentSpellPos(itr->second->Spell))
-                            if (!prevSpell || !player->HasSpell(prevSpell->Id) || spellInfo->GetRank() == 1)
-                                valid = false;
-
-                        break;
-                    }
-                }
-
-                if (valid)
-                    player->learnSpell(spellInfo->Id);
+                player->learnSpell(spellId);
             }
         }
     }
 
-    void ApplyAdditionalSpells(uint8 level, uint32 playerSpellFamily, Player* player)
+    void LearnQuestSpells(uint32 level, Player* player)
     {
-        auto spells = m_additionalSpells.find(level);
-        if (spells != m_additionalSpells.end())
+        for (auto const& questSpell : sLearnSpells->GetQuestSpells(player->getClass(), level))
         {
-            SpellFamilyToExtraSpells spellsMap = spells->second;
+            if (questSpell.raceMask && !(questSpell.raceMask & player->getRaceMask()))
+                continue;
 
-            auto spellsForPlayersFamily = spellsMap.find(playerSpellFamily);
-            if (spellsForPlayersFamily != spellsMap.end())
+            if (player->HasSpell(questSpell.spellId) || sLearnSpells->IsIgnored(questSpell.spellId))
+                continue;
+
+            if (DisableMgr::IsDisabledFor(DISABLE_TYPE_QUEST, questSpell.questId, player) || DisableMgr::IsDisabledFor(DISABLE_TYPE_SPELL, questSpell.spellId, player))
+                continue;
+
+            player->learnSpell(questSpell.spellId);
+        }
+    }
+
+    void ApplyAdditionalSpells(uint32 level, uint32 playerSpellFamily, Player* player)
+    {
+        auto spells = m_additionalSpells.find(uint8(level));
+        if (spells == m_additionalSpells.end())
+            return;
+
+        auto spellsForPlayersFamily = spells->second.find(playerSpellFamily);
+        if (spellsForPlayersFamily == spells->second.end())
+            return;
+
+        for (auto const& spell : spellsForPlayersFamily->second)
+        {
+            if (player->HasSpell(spell.spellId) || sLearnSpells->IsConfigIgnored(spell.spellId))
+                continue;
+
+            if (spell.faction == TeamId::TEAM_NEUTRAL || spell.faction == player->GetTeamId())
+                player->learnSpell(spell.spellId);
+        }
+    }
+
+    // Items that do not fit in the bags are sent by mail
+    static void GiveItems(Player* player, std::initializer_list<uint32> itemIds)
+    {
+        CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+        MailDraft draft("Learn Spells", "Your bags were full, so these items were sent by mail.");
+        bool mailed = false;
+
+        for (uint32 itemId : itemIds)
+        {
+            if (player->HasItemCount(itemId, 1, true))
+                continue;
+
+            ItemPosCountVec dest;
+            if (player->CanStoreNewItem(NULL_BAG, NULL_SLOT, dest, itemId, 1) == EQUIP_ERR_OK)
             {
-                std::vector<AddSpell> additionalSpellsToTeach = spellsForPlayersFamily->second;
-                for (auto const& spell : additionalSpellsToTeach)
-                {
-                    if (!(player->HasSpell(spell.spellId)) && (spell.faction == TeamId::TEAM_NEUTRAL || spell.faction == player->GetTeamId()))
-                        player->learnSpell(spell.spellId);
-                }
+                if (Item* item = player->StoreNewItem(dest, itemId, true))
+                    player->SendNewItem(item, 1, true, false);
+
+                continue;
+            }
+
+            if (Item* item = Item::CreateItem(itemId, 1, player))
+            {
+                item->SaveToDB(trans);
+                draft.AddItem(item);
+                mailed = true;
             }
         }
+
+        if (!mailed)
+            return;
+
+        draft.SendMailTo(trans, MailReceiver(player), MailSender(MAIL_NORMAL, 0, MAIL_STATIONERY_GM));
+        CharacterDatabase.CommitTransaction(trans);
     }
 
     uint32 GetSpellFamily(const Player* p)
@@ -530,5 +797,6 @@ private:
 
 void AddSC_LearnAllSpells()
 {
+    new LearnSpellsWorld();
     new LearnSpellsOnLevelUp();
 }
